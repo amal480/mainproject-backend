@@ -23,9 +23,9 @@ def get_head_direction(landmarks, width, height):
     diff = nose_tip_x - midpoint_x
 
     if diff > SENSITIVITY_THRESHOLD:
-        return "Looking Right"
-    elif diff < -SENSITIVITY_THRESHOLD:
         return "Looking Left"
+    elif diff < -SENSITIVITY_THRESHOLD:
+        return "Looking Right"
     else:
         return "Looking Straight"
 
