@@ -10,6 +10,8 @@ import torch
 import logging
 import asyncio
 from collections import deque
+import torchaudio
+import io
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -21,12 +23,18 @@ app = FastAPI()
 model = YOLO("yolo-Weights/yolov8n.pt").to("cuda")
 model.to("cuda")
 
-# Load Silero VAD model
-logger.info("Loading Silero VAD model...")
-vad_model, utils = torch.hub.load("snakers4/silero-vad", "silero_vad")
-vad_model = vad_model.to("cuda") if torch.cuda.is_available() else vad_model
-(get_speech_timestamps, _, vad_collect_chunks, _, _) = utils
-logger.info("Silero VAD model loaded successfully")
+# # Load Silero VAD model
+# logger.info("Loading Silero VAD model...")
+# vad_model, utils = torch.hub.load("snakers4/silero-vad", "silero_vad")
+# vad_model = vad_model.to("cuda") if torch.cuda.is_available() else vad_model
+# (get_speech_timestamps, _, vad_collect_chunks, _, _) = utils
+# logger.info("Silero VAD model loaded successfully")
+
+# Load Silero VAD model once at startup
+# print("Loading Silero VAD model...")
+# vad_model, utils = torch.hub.load("snakers4/silero-vad", "silero_vad", force_reload=True)
+# (get_speech_timestamps, _, _, _, _) = utils
+# print("Silero VAD model loaded.")
 
 # Object classes
 classNames = [
@@ -136,153 +144,84 @@ async def video_endpoint(websocket: WebSocket):
     finally:
         await websocket.close()
 
-class AudioProcessor:
-    """
-    Class to manage audio processing state and detection logic
-    """
-    def __init__(self, sampling_rate=16000, window_size_ms=200):
-        self.sampling_rate = sampling_rate
-        self.window_size_samples = int(sampling_rate * window_size_ms / 1000)
-        self.audio_buffer = deque(maxlen=10)  # Store up to 10 chunks for context
-        self.speech_detected = False
-        self.speech_prob_threshold = 0.5
-        self.speech_history = []  # Store recent speech detection results
-        self.history_size = 5  # Number of frames to keep for smoothing
-        self.consecutive_speech_frames = 0
-        self.consecutive_silence_frames = 0
-        self.min_speech_frames = 3  # Minimum frames to confirm speech
-        self.min_silence_frames = 10  # Minimum frames to confirm silence
-        self.debug_counter = 0
-    
-    def add_audio_chunk(self, audio_chunk):
-        """Add an audio chunk to the buffer"""
-        self.audio_buffer.append(audio_chunk)
-    
-    def process_current_buffer(self):
-        """Process the current audio buffer to detect speech"""
-        # Debug logging periodically
-        self.debug_counter += 1
-        debug_log = (self.debug_counter % 50 == 0)
-        
-        if not self.audio_buffer:
-            return False
-        
-        # Get the most recent audio chunk
-        audio_np = self.audio_buffer[-1]
-        
-        try:
-            # Convert to float32 and normalize to [-1, 1]
-            audio_float = audio_np.astype(np.float32) / 32768.0
-            
-            # Convert to PyTorch tensor
-            audio_tensor = torch.from_numpy(audio_float)
-            
-            # Ensure tensor is the right shape
-            if audio_tensor.ndim == 1:
-                audio_tensor = audio_tensor.unsqueeze(0)
-            
-            # Move to CUDA if available
-            if torch.cuda.is_available():
-                audio_tensor = audio_tensor.cuda()
-            
-            # Get speech probability
-            speech_prob = vad_model(audio_tensor, self.sampling_rate).item()
-            
-            # Update speech history for smoothing
-            self.speech_history.append(speech_prob > self.speech_prob_threshold)
-            if len(self.speech_history) > self.history_size:
-                self.speech_history.pop(0)
-            
-            # Determine current speech state with hysteresis
-            current_frame_has_speech = speech_prob > self.speech_prob_threshold
-            
-            if current_frame_has_speech:
-                self.consecutive_speech_frames += 1
-                self.consecutive_silence_frames = 0
-            else:
-                self.consecutive_silence_frames += 1
-                self.consecutive_speech_frames = 0
-            
-            # Apply state machine logic for speech detection
-            if not self.speech_detected and self.consecutive_speech_frames >= self.min_speech_frames:
-                self.speech_detected = True
-                logger.info(f"Speech detected! Probability: {speech_prob:.3f}")
-            elif self.speech_detected and self.consecutive_silence_frames >= self.min_silence_frames:
-                self.speech_detected = False
-                logger.info(f"Speech ended. Silence for {self.consecutive_silence_frames} frames")
-            
-            if debug_log:
-                logger.debug(f"Audio processing stats: prob={speech_prob:.3f}, " 
-                          f"speech_frames={self.consecutive_speech_frames}, "
-                          f"silence_frames={self.consecutive_silence_frames}, "
-                          f"detected={self.speech_detected}")
-            
-            return self.speech_detected
-            
-        except Exception as e:
-            logger.error(f"Error processing audio buffer: {str(e)}")
-            return False
+# @app.websocket("/audio")
+# async def audio_endpoint(websocket: WebSocket):
+#     """
+#     WebSocket endpoint to receive audio chunks and perform speech detection using Silero VAD.
+#     """
+#     await websocket.accept()
+#     logger.info("Audio WebSocket client connected")
 
-@app.websocket("/audio")
-async def audio_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("Audio WebSocket client connected")
-    
-    # Create audio processor instance
-    audio_processor = AudioProcessor()
-    last_status_time = time.time()
-    status_interval = 0.2  # Send status every 200ms
-    
-    try:
-        while True:
-            try:
-                # Receive audio data as bytes - THIS CAN THROW WebSocketDisconnect
-                audio_data = await websocket.receive_bytes()
-                
-                # Convert bytes to numpy array of int16
-                audio_np = np.frombuffer(audio_data, dtype=np.int16)
-                
-                # Add to audio processor
-                audio_processor.add_audio_chunk(audio_np)
-                
-                # Process and get speech detection result
-                is_speaking = audio_processor.process_current_buffer()
-                
-                # Only send updates at the specified interval to avoid flooding
-                current_time = time.time()
-                if current_time - last_status_time >= status_interval:
-                    status_text = "Speech detected" if is_speaking else "No speech detected"
-                    
-                    # Send results back to client
-                    await websocket.send_json({
-                        "type": "speech_detection",
-                        "speech_detected": is_speaking,
-                        "status": status_text,
-                        "timestamp": current_time
-                    })
-                    
-                    last_status_time = current_time
-                
-            except WebSocketDisconnect:
-                # Move this to the inner try block to catch disconnect during receive
-                logger.info("Audio WebSocket client disconnected")
-                break  # Break the outer loop
-            except asyncio.exceptions.CancelledError:
-                logger.info("Audio task cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Error processing audio chunk: {str(e)}")
-                # Continue processing next chunk instead of breaking
+#     try:
+#         while True:
+#             # Receive audio chunk as bytes
+#             audio_data = await websocket.receive_bytes()
+            
+#             # Convert bytes to tensor
+#             audio_np = np.frombuffer(audio_data, dtype=np.int16)
+#             audio_tensor = torch.from_numpy(audio_np).float() / 32768.0  # Normalize to [-1, 1]
+#             audio_tensor = audio_tensor.unsqueeze(0)  # Add batch dimension
 
-    except Exception as e:
-        # This should now only catch other types of exceptions
-        logger.error(f"Fatal error in audio websocket: {str(e)}", exc_info=True)
-    finally:
-        logger.info("Closing audio WebSocket connection")
-        try:
-            await websocket.close()
-        except RuntimeError:
-            # Handle case where socket is already closed
-            pass
+#             # Process with Silero VAD
+#             speech_timestamps = get_speech_timestamps(audio_tensor, vad_model, sampling_rate=16000)
+
+#             # Determine if speech is detected
+#             is_speaking = len(speech_timestamps) > 0
+#             status_text = "Speech detected" if is_speaking else "No speech detected"
+
+#             # Send result back to frontend
+#             await websocket.send_json({
+#                 "type": "speech_detection",
+#                 "speech_detected": is_speaking,
+#                 "status": status_text,
+#             })
+
+#     except WebSocketDisconnect:
+#         logger.info("Audio WebSocket disconnected")
+#     except Exception as e:
+#         logger.error(f"Error in audio WebSocket: {e}")
+#     finally:
+#         await websocket.close()
+
+# @app.websocket("/audio")
+# async def websocket_endpoint(websocket: WebSocket):
+#     await websocket.accept()
+#     print("Client connected")
+    
+#     chunk_count = 0
+#     try:
+#         while True:
+#             # Receive raw audio data
+#             audio_data = await websocket.receive_bytes()
+#             chunk_count += 1
+            
+#             print(f"Received audio chunk {chunk_count}, size: {len(audio_data)} bytes")
+            
+#             # Convert bytes to numpy array of int16
+#             audio_np = np.frombuffer(audio_data, dtype=np.int16)
+            
+#             # Convert to float32 and normalize to [-1, 1]
+#             audio_float = audio_np.astype(np.float32) / 32768.0
+            
+#             # Convert to PyTorch tensor
+#             audio_tensor = torch.from_numpy(audio_float).unsqueeze(0)  # Add channel dimension
+            
+#             # Run Silero VAD
+#             speech_timestamps = get_speech_timestamps(audio_tensor, vad_model, sampling_rate=16000)
+            
+#             # Log speech detection
+#             if speech_timestamps:
+#                 print(f"Speech detected in chunk {chunk_count}!")
+            
+#             # Send results back to client
+#             await websocket.send_json({"speech_timestamps": speech_timestamps})
+
+#     except Exception as e:
+#         print(f"Error in websocket connection: {e}")
+#         await websocket.close()
+#     finally:
+#         print("Client disconnected")
+
+
 
 # To run this code, use: uvicorn filename:app --reload
